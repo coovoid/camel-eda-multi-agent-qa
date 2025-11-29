@@ -10,4 +10,9 @@
 5、激活 camel 虚拟环境，出现类似(camel-ai-py3.10) C:\camel>中左侧的（虚拟环境）代表激活成功  
    mac/linux source .venv/bin/activate  
    windows .venv\Scripts\activate  
-6、从源代码安装依赖环境，大约需要 90 秒 uv pip install -e ".[all]"
+6、从源代码安装依赖环境，大约需要 90 秒 uv pip install -e ".[all]"  
+
+# 调用模型
+1、注册魔搭社区 https://modelscope.cn/my/overview  
+2、绑定阿里云账号（必需）  
+3、打开魔搭左侧栏的访问令牌，复制自己的令牌，并把它粘贴到api_key.env中
