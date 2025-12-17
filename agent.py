@@ -2,7 +2,6 @@ import streamlit as st
 import time as ts
 from datetime import datetime
 import base64
-from io import BytesIO
 import json
 import sys
 import os
@@ -13,6 +12,49 @@ import concurrent.futures
 from contextlib import contextmanager
 import threading
 import traceback
+from io import BytesIO
+
+def extract_file_content(uploaded_file):
+    """将上传文件转为纯文本，用于RAG索引。失败返回(None, error_msg)。"""
+    name = uploaded_file.name.lower()
+    suffix = name.split(".")[-1] if "." in name else ""
+    try:
+        data = uploaded_file.getvalue()
+        if suffix in ["txt", "md"]:
+            return data.decode("utf-8", errors="ignore"), None
+        if suffix == "json":
+            try:
+                obj = json.loads(data.decode("utf-8", errors="ignore"))
+                return json.dumps(obj, ensure_ascii=False, indent=2), None
+            except Exception:
+                return data.decode("utf-8", errors="ignore"), None
+        if suffix == "pdf":
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(BytesIO(data))
+                text = "\n".join([page.extract_text() or "" for page in reader.pages])
+                return text, None
+            except Exception as e:
+                return None, f"PDF解析失败: {e}"
+        if suffix == "docx":
+            try:
+                import docx
+                doc = docx.Document(BytesIO(data))
+                text = "\n".join([p.text for p in doc.paragraphs])
+                return text, None
+            except Exception as e:
+                return None, f"DOCX解析失败: {e}"
+        if suffix in ["xlsx", "xls"]:
+            try:
+                import pandas as pd
+                sheets = pd.read_excel(BytesIO(data), sheet_name=None)
+                text = "\n".join([df.to_csv(index=False) for df in sheets.values()])
+                return text, None
+            except Exception as e:
+                return None, f"Excel解析失败: {e}"
+        return None, "不支持的文件类型"
+    except Exception as e:
+        return None, f"读取失败: {e}"
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from multi_agent_backend import initialize_system, process_question, Vector_Storage
@@ -25,7 +67,7 @@ if 'rag_system' not in st.session_state:
     
 st.set_page_config(
     page_title="EDA多智能体整合问答系统",
-    page_icon="🤖",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -97,11 +139,11 @@ if 'api_config' not in st.session_state:
 #侧边栏
 with st.sidebar:
 # 系统配置
-    st.subheader("⚙️ 系统配置")
+    st.subheader("系统配置")
     
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("▶初始化系统", use_container_width=False, type="primary", 
+        if st.button("初始化系统", use_container_width=False, type="primary", 
                     help="初始化多智能体系统和RAG引擎"):
             with st.spinner("正在初始化系统..."):
                 # 获取API配置
@@ -116,10 +158,10 @@ with st.sidebar:
                             content = f.read()
                             if "API_KEY=" in content:
                                 api_key = content.split("API_KEY=")[1].strip()
-                                st.info("从api_key.env文件加载API密钥")
+                        st.info("从api_key.env文件加载API密钥")
                 
                 if not api_key:
-                    st.error("❌ 请先配置API密钥")
+                    st.error("请先配置API密钥")
                 else:
                     # 初始化后端系统
                     init_result = initialize_system(api_key, api_url)
@@ -127,12 +169,12 @@ with st.sidebar:
                         st.session_state.multi_agent = init_result["multi_agent"]
                         st.session_state.rag_system = init_result["rag_system"]
                         st.session_state.system_initialized = True
-                        st.success("✅ 系统初始化完成！")
+                        st.success("系统初始化完成！")
                     else:
-                        st.error(f"❌ 系统初始化失败: {init_result['message']}")
+                        st.error(f"系统初始化失败: {init_result['message']}")
                         # 特别处理API认证错误
                         if "阿里云账户" in init_result['message']:
-                            st.warning("💡 解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
+                            st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
                         # 显示详细的错误信息
                         with st.expander("详细错误信息"):
                             st.code(init_result.get("traceback", "无详细追踪信息"))
@@ -140,7 +182,7 @@ with st.sidebar:
                     st.rerun()
     
     with col2:
-        if st.button("🔄 重置系统", use_container_width=True, type="secondary",
+        if st.button("重置系统", use_container_width=True, type="secondary",
                     help="清空所有会话和数据"):
             st.session_state.clear()
             st.success("系统已重置")
@@ -148,19 +190,19 @@ with st.sidebar:
     
     st.divider()
      # 系统状态显示
-    st.subheader("🌟系统状态:")
+    st.subheader("系统状态:")
     # status_color = "✅" if st.session_state.system_initialized else "⭕"
     if st.session_state.system_initialized :    
-        st.title("✅已就绪")
+        st.title("已就绪")
     else:
-        st.title("⭕未初始化")
+        st.title("未初始化")
     st.divider()
     
    
     
     
     # 智能体团队管理
-    st.subheader("👥 智能体团队管理")
+    st.subheader("智能体团队管理")
     agents_options = ["检索专员", "关键信息提取专家", "检索文档评估专家", "拒绝评估专家", "语义一致性专家", "幻觉检测专家", "整合专家"]
     selected_agents = st.multiselect(
         "启用智能体",
@@ -175,7 +217,7 @@ with st.sidebar:
     
     
     # 系统信息
-    st.subheader("📈 系统信息")
+    st.subheader("系统信息")
     st.info(f"""
     - 对话记录: {len(st.session_state.chat_history)} 条
     - 知识库文档: {len(st.session_state.uploaded_files)} 个
@@ -194,26 +236,26 @@ col_main, col_agents = st.columns([2, 1])
 with col_main:
     # 聊天界面
     with st.container(border=True):
-        st.subheader("💬 对话")
+        st.subheader("对话")
         
         # 显示聊天历史
         chat_container = st.container(height=400, border=False)
         with chat_container:
             for i, chat in enumerate(st.session_state.chat_history):
                 if chat["role"] == "user":
-                    with st.chat_message("user", avatar="❓"):
+                    with st.chat_message("user"):
                         st.write(f"**您**: {chat['content']}")
                         if "timestamp" in chat:
                             st.caption(f"时间: {chat['timestamp']}")
                 else:  
-                    with st.chat_message("assistant",avatar="💁‍♂️"):
+                    with st.chat_message("assistant"):
                         st.write(f"**系统回答**: {chat['content']}")
                         if "timestamp" in chat:
                             st.caption(f"时间: {chat['timestamp']}")
                         
                       
                         if "agents" in chat:
-                            with st.expander("🔍 查看智能体分析详情", expanded=False):
+                            with st.expander("查看智能体分析详情", expanded=False):
                                 for agent_name, response in chat["agents"].items():
                                     if agent_name in st.session_state.agents_activated:
                                         st.markdown(f"**{agent_name}**:")
@@ -245,21 +287,44 @@ with col_main:
             # 文件上传
             uploaded_file = st.file_uploader(
                 "",
-                type=["pdf", "txt", "md", "docx", "xlsx"],
+                type=["pdf", "txt", "md", "docx", "xlsx", "json"],
                 accept_multiple_files=True,
                 help="上传文档将添加到RAG知识库中"
             )
             
             if uploaded_file:
+                new_texts = []
                 for file in uploaded_file:
                     if file.name not in [f["name"] for f in st.session_state.uploaded_files]:
+                        content, err = extract_file_content(file)
+                        if content is None:
+                            st.warning(f"{file.name} 解析失败: {err}")
+                            continue
                         st.session_state.uploaded_files.append({
                             "name": file.name,
                             "size": file.size,
                             "type": file.type,
-                            "upload_time": datetime.now().strftime("%H:%M")
+                            "upload_time": datetime.now().strftime("%H:%M"),
+                            "content": content
                         })
-                        st.success(f"✅ 已上传: {file.name}")
+                        new_texts.append(content)
+                        st.success(f"已上传: {file.name}")
+                # 写入向量库
+                if new_texts:
+                    if st.session_state.rag_system is not None:
+                        summary = st.session_state.rag_system.ingest_texts(new_texts)
+                        if isinstance(summary, dict):
+                            added = summary.get("added", 0) or 0
+                            errors = summary.get("errors", [])
+                        else:
+                            added = int(summary) if summary is not None else 0
+                            errors = []
+                        if added > 0:
+                            st.info(f"已索引 {added} 条文本片段")
+                        if errors:
+                            st.warning("部分文件未成功索引：\n" + "\n".join(errors))
+                    else:
+                        st.warning("系统未初始化，无法索引文档")
                       
         
         # 处理用户提交
@@ -274,7 +339,7 @@ with col_main:
             # 显示处理状态
             processing_placeholder = st.empty()
             with processing_placeholder:
-                with st.spinner("多智能体协作处理中..."):
+                with st.spinner("多智能体协作处理中...(响应可能需要几分钟，请耐心等待)"):
                     st.session_state.processing = True
                    
                     if st.session_state.multi_agent is not None:
@@ -302,7 +367,7 @@ with col_main:
                                 st.error(f"处理失败: {result['message']}")
                                 # 特别处理API认证错误
                                 if "阿里云账户" in result['message']:
-                                    st.warning("💡 解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
+                                    st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
                                 # 在开发阶段，显示更多调试信息
                                 with st.expander("详细错误信息"):
                                     st.code(str(result), language="json")
@@ -311,7 +376,7 @@ with col_main:
                             st.error(f"处理过程中发生异常: {str(e)}")
                             # 特别处理API认证错误
                             if "阿里云账户" in str(e):
-                                st.warning("💡 解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
+                                st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
                             # 显示详细的异常信息
                             with st.expander("异常详情"):
                                 st.code(traceback.format_exc(), language="python")
@@ -323,9 +388,9 @@ with col_main:
             st.rerun()
 
 with col_agents:
-    with st.expander("📖 使用说明", expanded=False):
+    with st.expander("使用说明", expanded=False):
         st.markdown("""
-    ### 🎯 系统使用指南
+    ### 系统使用指南
     
     **1. 初始化系统**
     - 点击侧边栏"初始化系统"按钮
@@ -355,19 +420,19 @@ with col_agents:
     - 点击"查看智能体分析详情"查看各智能体分析
     - 使用导出功能保存结果
     
-    ### 🔧 智能体功能
+    ### 智能体功能
     
     | 智能体 | 功能说明 |
     |--------|----------|
-    | 🔍 检索专员 | 从知识库检索相关信息 |
-    | 📊 关键信息提取 | 提取检索结果核心要点 |
-    | 📈 检索质量评估 | 评估检索相关性 |
-    | ⚠️ 拒绝行为检测 | 检查不当拒绝回答 |
-    | 🔗 语义一致性 | 验证逻辑一致性 |
-    | 👁️ 幻觉检测 | 检测虚构/错误信息 |
-    | 🎯 整合专家 | 生成最终专业回答 |
+    | 检索专员 | 从知识库检索相关信息 |
+    | 关键信息提取 | 提取检索结果核心要点 |
+    | 检索质量评估 | 评估检索相关性 |
+    | 拒绝行为检测 | 检查不当拒绝回答 |
+    | 语义一致性 | 验证逻辑一致性 |
+    | 幻觉检测 | 检测虚构/错误信息 |
+    | 整合专家 | 生成最终专业回答 |
     
-    ### 💡 使用建议
+    ### 使用建议
     1. 对于专业问题，建议上传相关技术文档
     2. 复杂问题建议启用全部智能体
     3. 简单问题可只启用核心智能体
@@ -375,7 +440,7 @@ with col_agents:
     """)
      # API配置
     with st.container(border=True):
-        st.subheader("🔑 API配置")
+        st.subheader("API配置")
         selected_api = st.selectbox(
             "选择API服务商",
             options=["硅基流动", "讯飞星火", "智谱AI", "其他"],
@@ -406,7 +471,7 @@ with col_agents:
             st.session_state.api_config["api_url"] = api_url
             
             # 添加API配置说明
-            st.info("💡 提示：使用ModelScope API需要绑定阿里云账户")
+            st.info("提示：使用ModelScope API需要绑定阿里云账户")
         
     # 知识库管理
     with st.container(border=True):
@@ -425,31 +490,43 @@ with col_agents:
                 <div class="uploaded-file">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
-                            <strong>📄 {file['name']}</strong><br>
+                            <strong>{file['name']}</strong><br>
                             <small>类型: {file['type']} | 大小: {file_size}</small>
                         </div>
                         <button style="background: none; border: none; color: #ff4444; cursor: pointer;" 
-                                onclick="alert('删除功能需在后端实现')">🗑️</button>
+                                onclick="alert('删除功能需在后端实现')">删除</button>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
             
             col_btn1, col_btn2 = st.columns(2)
             with col_btn1:
-                if st.button("🔍 重新索引", use_container_width=True, 
+                if st.button("重新索引", use_container_width=True, 
                            help="重新构建向量索引"):
                     with st.spinner("正在重新索引..."):
                         # 如果有RAG系统实例，重新索引
                         if st.session_state.rag_system is not None:
-                            # 这里应该处理所有上传文件的内容
-                            # 暂时用模拟方式
-                            ts.sleep(1)
-                            st.success("知识库索引更新完成！")
+                            texts = [f.get("content","") for f in st.session_state.uploaded_files if f.get("content")]
+                            if texts:
+                                st.session_state.rag_system.reset_storage()
+                                summary = st.session_state.rag_system.ingest_texts(texts)
+                                if isinstance(summary, dict):
+                                    added = summary.get("added", 0) or 0
+                                    errors = summary.get("errors", [])
+                                else:
+                                    added = int(summary) if summary is not None else 0
+                                    errors = []
+                                if added > 0:
+                                    st.success(f"知识库索引更新完成，共 {added} 条片段")
+                                if errors:
+                                    st.warning("部分文本未成功索引：\n" + "\n".join(errors))
+                            else:
+                                st.warning("未找到可索引的文本内容")
                         else:
                             st.warning("系统未初始化，无法重新索引")
             
             with col_btn2:
-                if st.button("🗑️清空知识库", use_container_width=True, type="secondary",
+                if st.button("清空知识库", use_container_width=True, type="secondary",
                            help="清空所有上传的文档"):
                     st.session_state.uploaded_files = []
                     st.success("知识库已清空")
@@ -459,7 +536,7 @@ with col_agents:
             st.caption("上传文档以启用RAG检索功能")
             
     with st.container(border=True):
-        st.subheader("📥 导出工具")
+        st.subheader("导出工具")
         if st.button("导出对话JSON", use_container_width=True, 
                     help="导出完整的对话记录为JSON格式"):
             if st.session_state.chat_history:
