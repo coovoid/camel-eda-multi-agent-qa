@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import threading
 import traceback
 from io import BytesIO
+import queue
 
 def extract_file_content(uploaded_file):
     """将上传文件转为纯文本，用于RAG索引。失败返回(None, error_msg)。"""
@@ -113,8 +114,104 @@ st.markdown("""
         border-radius: 1rem 1rem 1rem 0;
         margin: 0.5rem 0;
     }
+    }
+    .agent-status-item {
+        display: flex;
+        align-items: center;
+        padding: 0.75rem;
+        margin: 0.5rem 0;
+        border-radius: 0.5rem;
+        background-color: #f8f9fa;
+        border-left: 4px solid #dee2e6;
+    }
+    .agent-status-pending {
+        border-left-color: #6c757d;
+        background-color: #f8f9fa;
+    }
+    .agent-status-running {
+        border-left-color: #0d6efd;
+        background-color: #cfe2ff;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+    .agent-status-completed {
+        border-left-color: #198754;
+        background-color: #d1e7dd;
+    }
+    .agent-status-failed {
+        border-left-color: #dc3545;
+        background-color: #f8d7da;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
+    }
+    .status-icon {
+        margin-right: 0.75rem;
+        font-size: 1.2rem;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+def render_agent_status(agent_status_dict):
+    """agent状态可视化"""
+    agent_order = [
+        "检索专员",
+        "关键信息提取专家",
+        "检索文档评估专家",
+        "拒绝评估专家",
+        "语义一致性专家",
+        "幻觉检测专家",
+        "整合专家"
+    ]
+    
+    status_icons = {
+        "pending": "⏸️",
+        "running": "🔄",
+        "completed": "✅",
+        "failed": "❌"
+    }
+    
+    status_colors = {
+        "pending": "agent-status-pending",
+        "running": "agent-status-running",
+        "completed": "agent-status-completed",
+        "failed": "agent-status-failed"
+    }
+    
+    status_texts = {
+        "pending": "等待中",
+        "running": "处理中",
+        "completed": "已完成",
+        "failed": "失败"
+    }
+    
+    #计算进度
+    total = len(agent_order)
+    completed = sum(1 for agent in agent_order if agent_status_dict.get(agent) == "completed")
+    failed = sum(1 for agent in agent_order if agent_status_dict.get(agent) == "failed")
+    running = sum(1 for agent in agent_order if agent_status_dict.get(agent) == "running")
+    
+    progress = (completed + failed) / total if total > 0 else 0
+    
+    #显示进度条
+    st.progress(progress, text=f"进度: {completed}/{total} 已完成, {running} 进行中")
+    
+    # 显示各agent的状态
+    for idx, agent_name in enumerate(agent_order, 1):
+        status = agent_status_dict.get(agent_name, "pending")
+        icon = status_icons.get(status, "⏸️")
+        css_class = status_colors.get(status, "agent-status-pending")
+        status_text = status_texts.get(status, "未知")
+        
+        st.markdown(f"""
+        <div class="agent-status-item {css_class}">
+            <span class="status-icon">{icon}</span>
+            <div style="flex: 1;">
+                <strong>{idx}. {agent_name}</strong>
+                <div style="font-size: 0.875rem; color: #6c757d;">{status_text}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
@@ -135,6 +232,10 @@ if 'api_config' not in st.session_state:
         "api_key": "",
         "api_url": "https://api-inference.modelscope.cn/v1"
     }
+if 'current_agent_status' not in st.session_state:
+    st.session_state.current_agent_status = {}
+if 'processing_result' not in st.session_state:
+    st.session_state.processing_result = None
 
 #侧边栏
 with st.sidebar:
@@ -336,58 +437,98 @@ with col_main:
                 "timestamp": datetime.now().strftime("%H:%M")
             })
             
-            # 显示处理状态
-            processing_placeholder = st.empty()
-            with processing_placeholder:
-                with st.spinner("多智能体协作处理中...(响应可能需要几分钟，请耐心等待)"):
-                    st.session_state.processing = True
-                   
-                    if st.session_state.multi_agent is not None:
-                        try:
+            # 初始化agent状态
+            initial_status = {
+                "检索专员": "pending",
+                "关键信息提取专家": "pending",
+                "检索文档评估专家": "pending",
+                "拒绝评估专家": "pending",
+                "语义一致性专家": "pending",
+                "幻觉检测专家": "pending",
+                "整合专家": "pending"
+            }
+            st.session_state.current_agent_status = initial_status.copy()
+            st.session_state.processing = True
+            
+            if st.session_state.multi_agent is not None:
+                try:
+                    # 显示处理状态
+                    processing_placeholder = st.empty()
+                    with processing_placeholder:
+                        with st.spinner("多智能体协作处理中...(响应可能需要几分钟，请耐心等待)"):
                             # 处理问题
                             result = process_question(st.session_state.multi_agent, user_input.strip())
-                            
-                            if result["status"] == "success":
-                                # 获取智能体响应
-                                agents_responses = result.get("agents_responses", {})
-                                
-                                st.session_state.processing = False
-                                
-                                # 添加助手消息到历史
-                                st.session_state.chat_history.append({
-                                    "role": "assistant",
-                                    "content": result["final_result"],
-                                    "agents": {k: v for k, v in agents_responses.items() 
-                                              if k in st.session_state.agents_activated},
-                                    "timestamp": datetime.now().strftime("%H:%M")
-                                })
-                            else:
-                                st.session_state.processing = False
-                                # 显示详细的错误信息
-                                st.error(f"处理失败: {result['message']}")
-                                # 特别处理API认证错误
-                                if "阿里云账户" in result['message']:
-                                    st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
-                                # 在开发阶段，显示更多调试信息
-                                with st.expander("详细错误信息"):
-                                    st.code(str(result), language="json")
-                        except Exception as e:
-                            st.session_state.processing = False
-                            st.error(f"处理过程中发生异常: {str(e)}")
-                            # 特别处理API认证错误
-                            if "阿里云账户" in str(e):
-                                st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
-                            # 显示详细的异常信息
-                            with st.expander("异常详情"):
-                                st.code(traceback.format_exc(), language="python")
+                    
+                    # 获取最终状态并更新session_state
+                    final_status = initial_status.copy()
+                    if result and result.get("agent_status"):
+                        final_status = result["agent_status"]
+                    st.session_state.current_agent_status = final_status
+                    
+                    processing_placeholder.empty()
+                    
+                    if result and result["status"] == "success":
+                        # 获取智能体响应
+                        agents_responses = result.get("agents_responses", {})
+                        
+                        st.session_state.processing = False
+                        
+                        # 添加助手消息到历史
+                        st.session_state.chat_history.append({
+                            "role": "assistant",
+                            "content": result["final_result"],
+                            "agents": {k: v for k, v in agents_responses.items() 
+                                      if k in st.session_state.agents_activated},
+                            "timestamp": datetime.now().strftime("%H:%M"),
+                            "agent_status": final_status
+                        })
                     else:
                         st.session_state.processing = False
-                        st.error("系统未正确初始化，请重新初始化系统")
-                    
-            processing_placeholder.empty()
+                        # 显示详细的错误信息
+                        st.error(f"处理失败: {result.get('message', '未知错误')}")
+                        # 特别处理API认证错误
+                        if "阿里云账户" in result.get('message', ''):
+                            st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
+                        # 在开发阶段，显示更多调试信息
+                        with st.expander("详细错误信息"):
+                            st.code(str(result), language="json")
+                        
+                except Exception as e:
+                    st.session_state.processing = False
+                    st.error(f"处理过程中发生异常: {str(e)}")
+                    # 特别处理API认证错误
+                    if "阿里云账户" in str(e):
+                        st.warning("解决方案：请访问 ModelScope 官网绑定您的阿里云账户，然后重新生成API密钥")
+                    # 显示详细的异常信息
+                    with st.expander("异常详情"):
+                        st.code(traceback.format_exc(), language="python")
+            else:
+                st.session_state.processing = False
+                st.error("系统未正确初始化，请重新初始化系统")
+            
             st.rerun()
 
 with col_agents:
+    # Agent工作流程可视化
+    if st.session_state.current_agent_status or st.session_state.processing:
+        with st.container(border=True):
+            st.subheader("智能体工作流程")
+            if st.session_state.current_agent_status:
+                render_agent_status(st.session_state.current_agent_status)
+            else:
+                # 显示初始状态（在处理中，但还没有状态更新）
+                initial_status = {
+                    "检索专员": "pending",
+                    "关键信息提取专家": "pending",
+                    "检索文档评估专家": "pending",
+                    "拒绝评估专家": "pending",
+                    "语义一致性专家": "pending",
+                    "幻觉检测专家": "pending",
+                    "整合专家": "pending"
+                }
+                render_agent_status(initial_status)
+        st.divider()
+    
     with st.expander("使用说明", expanded=False):
         st.markdown("""
     ### 系统使用指南

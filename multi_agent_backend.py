@@ -317,6 +317,16 @@ class multi_agents(Workforce):
         self.model_type = model_type
         self.history_list = []
         self.agent_name = agent_name
+        #添加agent的几个状态状态: "pending", "running", "completed", "failed"
+        self.agent_status = {
+            "检索专员": "pending",
+            "关键信息提取专家": "pending",
+            "检索文档评估专家": "pending",
+            "拒绝评估专家": "pending",
+            "语义一致性专家": "pending",
+            "幻觉检测专家": "pending",
+            "整合专家": "pending"
+        }
     #初始化RAG系统
         self.RAG_system = Vector_Storage(storage_path = "RAG_storage_path",
                                          api_key = api_key,
@@ -330,6 +340,15 @@ class multi_agents(Workforce):
             system_message="你是RAG检索专员，基于知识库回答问题",
             rag_system=self.RAG_system
         )
+    
+    def get_agent_status(self):
+        """获取当前所有agent的状态"""
+        return self.agent_status.copy()
+    
+    def _update_agent_status(self, agent_name, status):
+        """更新agent状态: pending, running, completed, failed"""
+        if agent_name in self.agent_status:
+            self.agent_status[agent_name] = status
 #检索专员
     def ResearcherAgent(self,input_text):
         prompt =f"""
@@ -446,40 +465,97 @@ class multi_agents(Workforce):
 
     def _run_primary_agent(self, user_question, use_rag):
         """根据是否启用RAG决定首个Agent的执行，并写入历史。"""
-        if use_rag:
-            rag_response = self.RAG_agent_instance.run(user_question)
-            if rag_response["status"] != "success":
-                res1 = f"RAG检索失败：{rag_response['response']}"
-            else:
-                res1 = rag_response["response"]
-            self.history_list.append(res1)
-            self._log_step("1/7", "RAG检索员", res1)
+        agent_name = "检索专员"
+        self._update_agent_status(agent_name, "running")
+        try:
+            if use_rag:
+                rag_response = self.RAG_agent_instance.run(user_question)
+                if rag_response["status"] != "success":
+                    res1 = f"RAG检索失败：{rag_response['response']}"
+                    self._update_agent_status(agent_name, "failed")
+                else:
+                    res1 = rag_response["response"]
+                    self._update_agent_status(agent_name, "completed")
+                self.history_list.append(res1)
+                self._log_step("1/7", "RAG检索员", res1)
+                return res1
+            res1 = self.ResearcherAgent(user_question)
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("1/7", "检索专员", res1)
             return res1
-        res1 = self.ResearcherAgent(user_question)
-        self._log_step("1/7", "检索专员", res1)
-        return res1
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
 
     def _run_followup_agents(self, user_question):
         """执行固定顺序的后续六个智能体。"""
-        res2 = self.KeyPointExtractorAgent(self.history_list[0])
-        self._log_step("2/7", "要点提取专家", res2)
-
-        res3 = self.RetrievalQualityAgent(user_question)
-        self._log_step("3/7", "检索质量专家", res3)
-
-        res4 = self.RejectionEvaluationAgent(user_question)
-        self._log_step("4/7", "拒绝评估专家", res4)
-
-        res5 = self.SemanticConsistencyAgent(user_question)
-        self._log_step("5/7", "语义一致性专家", res5)
-
-        res6 = self.HallucinationDetectionAgent(user_question)
-        self._log_step("6/7", "幻觉检测专家", res6)
-
-        final_res = self.IntegrationAgent(user_question)
-        final_res = self._enforce_no_refusal(final_res, user_question)
-        self._log_step("7/7", "最终整合专家", final_res)
-        return final_res
+        # 关键信息提取专家
+        agent_name = "关键信息提取专家"
+        self._update_agent_status(agent_name, "running")
+        try:
+            res2 = self.KeyPointExtractorAgent(self.history_list[0])
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("2/7", "要点提取专家", res2)
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
+        
+        # 检索文档评估专家
+        agent_name = "检索文档评估专家"
+        self._update_agent_status(agent_name, "running")
+        try:
+            res3 = self.RetrievalQualityAgent(user_question)
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("3/7", "检索质量专家", res3)
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
+        
+        # 拒绝评估专家
+        agent_name = "拒绝评估专家"
+        self._update_agent_status(agent_name, "running")
+        try:
+            res4 = self.RejectionEvaluationAgent(user_question)
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("4/7", "拒绝评估专家", res4)
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
+        
+        # 语义一致性专家
+        agent_name = "语义一致性专家"
+        self._update_agent_status(agent_name, "running")
+        try:
+            res5 = self.SemanticConsistencyAgent(user_question)
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("5/7", "语义一致性专家", res5)
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
+        
+        # 幻觉检测专家
+        agent_name = "幻觉检测专家"
+        self._update_agent_status(agent_name, "running")
+        try:
+            res6 = self.HallucinationDetectionAgent(user_question)
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("6/7", "幻觉检测专家", res6)
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
+        
+        # 整合专家
+        agent_name = "整合专家"
+        self._update_agent_status(agent_name, "running")
+        try:
+            final_res = self.IntegrationAgent(user_question)
+            final_res = self._enforce_no_refusal(final_res, user_question)
+            self._update_agent_status(agent_name, "completed")
+            self._log_step("7/7", "最终整合专家", final_res)
+            return final_res
+        except Exception as e:
+            self._update_agent_status(agent_name, "failed")
+            raise
 
     def _enforce_no_refusal(self, text, user_question):
         """若回答出现拒绝措辞，生成兜底技术建议，确保有输出。"""
@@ -520,13 +596,17 @@ class multi_agents(Workforce):
     def run_all_agents(self,user_question,rag_result):
         try:
             self.history_list = []
+            # 重置所有agent状态为pending
+            for agent_name in self.agent_status.keys():
+                self.agent_status[agent_name] = "pending"
             use_rag = bool(rag_result)
             self._run_primary_agent(user_question, use_rag)
             final_res = self._run_followup_agents(user_question)
             return {
                 "final_result": final_res,
                 "model_history": self.history_list,
-                "agents_responses": self._collect_agent_responses()
+                "agents_responses": self._collect_agent_responses(),
+                "agent_status": self.get_agent_status()
             }
 
         except Exception as e:
@@ -534,7 +614,8 @@ class multi_agents(Workforce):
             return {
                 "final_result":f"调度失败{str(e)}",
                 "model_history": self.history_list,
-                "agents_responses": self._collect_agent_responses()
+                "agents_responses": self._collect_agent_responses(),
+                "agent_status": self.get_agent_status()
             }
 #定义自动转换模式（有rag检索内容就转rag模式，无就转普通对话模式）
     def auto_run(self, user_question):
@@ -583,13 +664,17 @@ def process_question(multi_agent, user_question):
         return {
             "status": "success",
             "final_result": result.get("final_result", ""),
-            "agents_responses": result.get("agents_responses", {})
+            "agents_responses": result.get("agents_responses", {}),
+            "agent_status": result.get("agent_status", {})
         }
     except Exception as e:
+        # 获取当前状态（即使失败也可能有部分agent完成了）
+        agent_status = multi_agent.get_agent_status() if multi_agent else {}
         return {
             "status": "failure",
             "message": str(e),
-            "traceback": traceback.format_exc()
+            "traceback": traceback.format_exc(),
+            "agent_status": agent_status
         }
 #主程序入口
 if __name__ == "__main__":
