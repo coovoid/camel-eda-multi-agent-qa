@@ -1,0 +1,21 @@
+# EDA 多智能体问答系统依赖
+# camel-ai 核心（勿用 [all]，Python 3.12 下会失败）
+camel-ai==0.2.38
+
+# camel 导入链所需（基础包未自动安装）
+requests_oauthlib>=2.0.0
+unstructured>=0.16.0
+
+# 与 camel-ai 0.2.38 兼容的版本约束（安装 unstructured 后需重新锁定）
+pydantic>=2.9,<2.10
+psutil>=5.9.8,<6
+
+# 应用依赖
+streamlit>=1.28.0
+requests>=2.28.0
+python-dotenv>=1.0.0
+langchain-text-splitters>=0.2.0
+PyPDF2>=3.0.0
+python-docx>=1.0.0
+pandas>=2.0.0
+openpyxl>=3.1.0

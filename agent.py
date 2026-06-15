@@ -1,19 +1,25 @@
-import streamlit as st
+import json
+import os
+import sys
+import traceback
 import time as ts
 from datetime import datetime
-import base64
-import json
-import sys
-import os
-from typing import Dict, List, Any
-import requests
-import asyncio
-import concurrent.futures
-from contextlib import contextmanager
-import threading
-import traceback
 from io import BytesIO
-import queue
+
+import streamlit as st
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from multi_agent_backend import (
+    AGENT_NAMES,
+    DEFAULT_API_URL,
+    DEFAULT_CHAT_MODEL,
+    DEPRECATED_CHAT_MODELS,
+    RECOMMENDED_CHAT_MODELS,
+    initialize_system,
+    process_question,
+)
+
 
 def extract_file_content(uploaded_file):
     """将上传文件转为纯文本，用于RAG索引。失败返回(None, error_msg)。"""
@@ -57,8 +63,33 @@ def extract_file_content(uploaded_file):
     except Exception as e:
         return None, f"读取失败: {e}"
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from multi_agent_backend import initialize_system, process_question, Vector_Storage
+
+def load_api_key_from_env():
+    env_file_path = "api_key.env"
+    if not os.path.exists(env_file_path):
+        return ""
+    with open(env_file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if "API_KEY=" in content:
+        return content.split("API_KEY=", 1)[1].strip()
+    return ""
+
+
+def show_ingest_summary(summary):
+    if isinstance(summary, dict):
+        added = summary.get("added", 0) or 0
+        errors = summary.get("errors", [])
+    else:
+        added = int(summary) if summary is not None else 0
+        errors = []
+    if added > 0:
+        st.info(f"已索引 {added} 条文本片段")
+    if errors:
+        st.warning("部分文件未成功索引：\n" + "\n".join(errors))
+
+
+def pending_agent_status():
+    return {name: "pending" for name in AGENT_NAMES}
 
 
 if 'multi_agent' not in st.session_state:
@@ -154,16 +185,6 @@ st.markdown("""
 
 def render_agent_status(agent_status_dict):
     """agent状态可视化"""
-    agent_order = [
-        "检索专员",
-        "关键信息提取专家",
-        "检索文档评估专家",
-        "拒绝评估专家",
-        "语义一致性专家",
-        "幻觉检测专家",
-        "整合专家"
-    ]
-    
     status_icons = {
         "pending": "⏸️",
         "running": "🔄",
@@ -185,11 +206,10 @@ def render_agent_status(agent_status_dict):
         "failed": "失败"
     }
     
-    #计算进度
-    total = len(agent_order)
-    completed = sum(1 for agent in agent_order if agent_status_dict.get(agent) == "completed")
-    failed = sum(1 for agent in agent_order if agent_status_dict.get(agent) == "failed")
-    running = sum(1 for agent in agent_order if agent_status_dict.get(agent) == "running")
+    total = len(AGENT_NAMES)
+    completed = sum(1 for agent in AGENT_NAMES if agent_status_dict.get(agent) == "completed")
+    failed = sum(1 for agent in AGENT_NAMES if agent_status_dict.get(agent) == "failed")
+    running = sum(1 for agent in AGENT_NAMES if agent_status_dict.get(agent) == "running")
     
     progress = (completed + failed) / total if total > 0 else 0
     
@@ -197,7 +217,7 @@ def render_agent_status(agent_status_dict):
     st.progress(progress, text=f"进度: {completed}/{total} 已完成, {running} 进行中")
     
     # 显示各agent的状态
-    for idx, agent_name in enumerate(agent_order, 1):
+    for idx, agent_name in enumerate(AGENT_NAMES, 1):
         status = agent_status_dict.get(agent_name, "pending")
         icon = status_icons.get(status, "⏸️")
         css_class = status_colors.get(status, "agent-status-pending")
@@ -216,31 +236,61 @@ def render_agent_status(agent_status_dict):
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'agents_activated' not in st.session_state:
-    st.session_state.agents_activated = ["检索专员", "关键信息提取专家", "检索文档评估专家", "拒绝评估专家", "语义一致性专家", "幻觉检测专家", "整合专家"]
+    st.session_state.agents_activated = list(AGENT_NAMES)
 if 'system_initialized' not in st.session_state:
     st.session_state.system_initialized = False
-if 'rag_knowledge' not in st.session_state:
-    st.session_state.rag_knowledge = ""
 if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 if 'processing' not in st.session_state:
     st.session_state.processing = False
 if 'api_config' not in st.session_state:
     st.session_state.api_config = {
-        "selected_api": "deepseek",
-        "custom_api": False,
         "api_key": "",
-        "api_url": "https://api-inference.modelscope.cn/v1"
+        "api_url": DEFAULT_API_URL,
+        "chat_model": DEFAULT_CHAT_MODEL,
     }
+if 'chat_model' not in st.session_state.api_config:
+    st.session_state.api_config["chat_model"] = DEFAULT_CHAT_MODEL
 if 'current_agent_status' not in st.session_state:
     st.session_state.current_agent_status = {}
-if 'processing_result' not in st.session_state:
-    st.session_state.processing_result = None
 
 #侧边栏
 with st.sidebar:
 # 系统配置
     st.subheader("系统配置")
+
+    chat_model = st.selectbox(
+        "对话模型（魔搭 ModelScope）",
+        options=RECOMMENDED_CHAT_MODELS,
+        index=RECOMMENDED_CHAT_MODELS.index(
+            st.session_state.api_config.get("chat_model", DEFAULT_CHAT_MODEL)
+        ) if st.session_state.api_config.get("chat_model", DEFAULT_CHAT_MODEL) in RECOMMENDED_CHAT_MODELS else 0,
+        help="勿使用 QVQ 系列，易触发限流或返回空结果",
+    )
+    st.session_state.api_config["chat_model"] = chat_model
+    st.caption(f"推荐默认：{DEFAULT_CHAT_MODEL}")
+
+    if st.session_state.system_initialized and st.session_state.multi_agent is not None:
+        active_model = getattr(st.session_state.multi_agent, "model_type", "未知")
+        st.text(f"当前已加载：{active_model}")
+        if active_model in DEPRECATED_CHAT_MODELS or active_model != chat_model:
+            st.warning("模型与选择不一致，请点「重置系统」后重新「初始化系统」")
+
+    with st.expander("API 密钥（可选）", expanded=False):
+        st.caption("默认从 api_key.env 读取；也可在此临时覆盖")
+        api_key_input = st.text_input(
+            "API 密钥",
+            type="password",
+            value=st.session_state.api_config.get("api_key", ""),
+            placeholder="留空则使用 api_key.env",
+        )
+        api_url_input = st.text_input(
+            "API 端点",
+            value=st.session_state.api_config.get("api_url", DEFAULT_API_URL),
+        )
+        st.session_state.api_config["api_key"] = api_key_input
+        st.session_state.api_config["api_url"] = api_url_input
+        st.caption("魔搭 API 需绑定阿里云账号")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -249,28 +299,26 @@ with st.sidebar:
             with st.spinner("正在初始化系统..."):
                 # 获取API配置
                 api_key = st.session_state.api_config.get("api_key", "")
-                api_url = st.session_state.api_config.get("api_url", "https://api-inference.modelscope.cn/v1")
+                api_url = st.session_state.api_config.get("api_url", DEFAULT_API_URL)
+                chat_model = st.session_state.api_config.get("chat_model", DEFAULT_CHAT_MODEL)
                 
                 # 如果界面没有输入API密钥，尝试从文件加载
                 if not api_key:
-                    env_file_path = "api_key.env"
-                    if os.path.exists(env_file_path):
-                        with open(env_file_path, "r") as f:
-                            content = f.read()
-                            if "API_KEY=" in content:
-                                api_key = content.split("API_KEY=")[1].strip()
+                    api_key = load_api_key_from_env()
+                    if api_key:
                         st.info("从api_key.env文件加载API密钥")
                 
                 if not api_key:
                     st.error("请先配置API密钥")
                 else:
                     # 初始化后端系统
-                    init_result = initialize_system(api_key, api_url)
+                    init_result = initialize_system(api_key, api_url, model_type=chat_model)
                     if init_result["status"] == "success":
                         st.session_state.multi_agent = init_result["multi_agent"]
                         st.session_state.rag_system = init_result["rag_system"]
                         st.session_state.system_initialized = True
-                        st.success("系统初始化完成！")
+                        st.session_state.active_chat_model = init_result.get("model_type", chat_model)
+                        st.success(f"系统初始化完成！模型：{init_result.get('model_type', chat_model)}")
                     else:
                         st.error(f"系统初始化失败: {init_result['message']}")
                         # 特别处理API认证错误
@@ -304,10 +352,9 @@ with st.sidebar:
     
     # 智能体团队管理
     st.subheader("智能体团队管理")
-    agents_options = ["检索专员", "关键信息提取专家", "检索文档评估专家", "拒绝评估专家", "语义一致性专家", "幻觉检测专家", "整合专家"]
     selected_agents = st.multiselect(
         "启用智能体",
-        options=agents_options,
+        options=AGENT_NAMES,
         default=st.session_state.agents_activated,
         placeholder="选择要启用的智能体...",
         help="选择参与问答流程的智能体成员"
@@ -331,6 +378,14 @@ with st.sidebar:
 
 st.title("EDA多智能体整合问答系统")
 st.caption("基于RAG技术的多智能体协作问答平台")
+
+if st.session_state.system_initialized and st.session_state.multi_agent is not None:
+    _loaded = getattr(st.session_state.multi_agent, "model_type", "")
+    if _loaded in DEPRECATED_CHAT_MODELS:
+        st.error(
+            f"当前仍在使用已弃用模型 **{_loaded}**（易 429 限流或返回空结果）。"
+            "请先在左侧点击 **重置系统**，再 **初始化系统**。"
+        )
 
 col_main, col_agents = st.columns([2, 1])
 
@@ -414,16 +469,7 @@ with col_main:
                 if new_texts:
                     if st.session_state.rag_system is not None:
                         summary = st.session_state.rag_system.ingest_texts(new_texts)
-                        if isinstance(summary, dict):
-                            added = summary.get("added", 0) or 0
-                            errors = summary.get("errors", [])
-                        else:
-                            added = int(summary) if summary is not None else 0
-                            errors = []
-                        if added > 0:
-                            st.info(f"已索引 {added} 条文本片段")
-                        if errors:
-                            st.warning("部分文件未成功索引：\n" + "\n".join(errors))
+                        show_ingest_summary(summary)
                     else:
                         st.warning("系统未初始化，无法索引文档")
                       
@@ -438,16 +484,7 @@ with col_main:
             })
             
             # 初始化agent状态
-            initial_status = {
-                "检索专员": "pending",
-                "关键信息提取专家": "pending",
-                "检索文档评估专家": "pending",
-                "拒绝评估专家": "pending",
-                "语义一致性专家": "pending",
-                "幻觉检测专家": "pending",
-                "整合专家": "pending"
-            }
-            st.session_state.current_agent_status = initial_status.copy()
+            st.session_state.current_agent_status = pending_agent_status()
             st.session_state.processing = True
             
             if st.session_state.multi_agent is not None:
@@ -460,9 +497,7 @@ with col_main:
                             result = process_question(st.session_state.multi_agent, user_input.strip())
                     
                     # 获取最终状态并更新session_state
-                    final_status = initial_status.copy()
-                    if result and result.get("agent_status"):
-                        final_status = result["agent_status"]
+                    final_status = result.get("agent_status") or pending_agent_status()
                     st.session_state.current_agent_status = final_status
                     
                     processing_placeholder.empty()
@@ -517,16 +552,7 @@ with col_agents:
                 render_agent_status(st.session_state.current_agent_status)
             else:
                 # 显示初始状态（在处理中，但还没有状态更新）
-                initial_status = {
-                    "检索专员": "pending",
-                    "关键信息提取专家": "pending",
-                    "检索文档评估专家": "pending",
-                    "拒绝评估专家": "pending",
-                    "语义一致性专家": "pending",
-                    "幻觉检测专家": "pending",
-                    "整合专家": "pending"
-                }
-                render_agent_status(initial_status)
+                render_agent_status(pending_agent_status())
         st.divider()
     
     with st.expander("使用说明", expanded=False):
@@ -534,29 +560,24 @@ with col_agents:
     ### 系统使用指南
     
     **1. 初始化系统**
-    - 点击侧边栏"初始化系统"按钮
-    - 等待系统初始化完成（约2-3秒）
+    - 左侧选择对话模型，点击「初始化系统」
+    - API 密钥默认读取 api_key.env
     
-    **2. 配置API（可选）**
-    - 选择API服务商
-    - 如需自定义API，勾选"使用自定义API"
-    - 填写API密钥和端点地址
-    
-    **3. 管理智能体团队**
+    **2. 管理智能体团队**
     - 在侧边栏选择要启用的智能体
     - 系统默认启用全部7个智能体
     
-    **4. 上传知识文档（RAG功能）**
+    **3. 上传知识文档（RAG功能）**
     - 支持PDF、TXT、MD、Word等格式
     - 上传文档将自动添加到知识库
     - 可点击"重新索引"更新向量索引
     
-    **5. 开始对话**
+    **4. 开始对话**
     - 在输入框输入问题
     - 可同时上传相关文档
     - 点击"发送"开始处理
     
-    **6. 查看结果**
+    **5. 查看结果**
     - 查看最终回答
     - 点击"查看智能体分析详情"查看各智能体分析
     - 使用导出功能保存结果
@@ -579,41 +600,6 @@ with col_agents:
     3. 简单问题可只启用核心智能体
     4. 定期重新索引以保证检索质量
     """)
-     # API配置
-    with st.container(border=True):
-        st.subheader("API配置")
-        selected_api = st.selectbox(
-            "选择API服务商",
-            options=["硅基流动", "讯飞星火", "智谱AI", "其他"],
-            index=0,
-            help="选择要使用的模型API服务商"
-        )
-        st.session_state.api_config["selected_api"] = selected_api
-        
-        use_custom_api = st.checkbox("使用自定义API", value=False, 
-                                    help="启用自定义API端点配置")
-        st.session_state.api_config["custom_api"] = use_custom_api
-        
-        if use_custom_api:
-            api_key = st.text_input(
-                "API密钥",
-                type="password",
-                placeholder="请输入您的API密钥",
-                help="请输入您的API访问密钥",
-                value=st.session_state.api_config.get("api_key", "")
-            )
-            api_url = st.text_input(
-                "API端点",
-                value=st.session_state.api_config.get("api_url", "https://api-inference.modelscope.cn/v1"),
-                placeholder="请输入API端点URL",
-                help="API服务端点地址"
-            )
-            st.session_state.api_config["api_key"] = api_key
-            st.session_state.api_config["api_url"] = api_url
-            
-            # 添加API配置说明
-            st.info("提示：使用ModelScope API需要绑定阿里云账户")
-        
     # 知识库管理
     with st.container(border=True):
         st.subheader(" 知识库管理")
@@ -629,13 +615,9 @@ with col_agents:
                 
                 st.markdown(f"""
                 <div class="uploaded-file">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <strong>{file['name']}</strong><br>
-                            <small>类型: {file['type']} | 大小: {file_size}</small>
-                        </div>
-                        <button style="background: none; border: none; color: #ff4444; cursor: pointer;" 
-                                onclick="alert('删除功能需在后端实现')">删除</button>
+                    <div>
+                        <strong>{file['name']}</strong><br>
+                        <small>类型: {file['type']} | 大小: {file_size}</small>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -651,16 +633,11 @@ with col_agents:
                             if texts:
                                 st.session_state.rag_system.reset_storage()
                                 summary = st.session_state.rag_system.ingest_texts(texts)
-                                if isinstance(summary, dict):
-                                    added = summary.get("added", 0) or 0
-                                    errors = summary.get("errors", [])
-                                else:
-                                    added = int(summary) if summary is not None else 0
-                                    errors = []
+                                added = summary.get("added", 0) if isinstance(summary, dict) else 0
                                 if added > 0:
                                     st.success(f"知识库索引更新完成，共 {added} 条片段")
-                                if errors:
-                                    st.warning("部分文本未成功索引：\n" + "\n".join(errors))
+                                if isinstance(summary, dict) and summary.get("errors"):
+                                    st.warning("部分文本未成功索引：\n" + "\n".join(summary["errors"]))
                             else:
                                 st.warning("未找到可索引的文本内容")
                         else:

@@ -1,357 +1,279 @@
-import multiprocessing
-from camel.agents import ChatAgent
-from camel.embeddings import OpenAICompatibleEmbedding
-from camel.storages import QdrantStorage
-from camel.retrievers import HybridRetriever
-from camel.models import ModelFactory
-from camel.types import ModelPlatformType, RoleType
-import requests
-import json
+"""EDA 多智能体 RAG 后端。"""
+
 import os
 import time
-import pickle
-import tempfile
 import traceback
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from camel.agents import ChatAgent
 from camel.messages import BaseMessage
+from camel.models import ModelFactory
+from camel.retrievers import HybridRetriever
+from camel.types import ModelPlatformType, RoleType
+
+DEFAULT_API_URL = "https://api-inference.modelscope.cn/v1"
+DEFAULT_CHAT_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+RECOMMENDED_CHAT_MODELS = [
+    "deepseek-ai/DeepSeek-V4-Flash",
+    "deepseek-ai/DeepSeek-V3.2",
+    "moonshotai/Kimi-K2.5",
+    "MiniMax/MiniMax-M2.5",
+]
+DEPRECATED_CHAT_MODELS = {
+    "Qwen/QVQ-72B-Preview",
+    "Qwen/Qwen2.5-72B-Instruct",
+    "Qwen/Qwen2.5-32B-Instruct",
+}
+AGENT_NAMES = [
+    "检索专员",
+    "关键信息提取专家",
+    "检索文档评估专家",
+    "拒绝评估专家",
+    "语义一致性专家",
+    "幻觉检测专家",
+    "整合专家",
+]
+AGENT_STEP_DELAY = 0.8
+BASE_SYSTEM_MESSAGE = (
+    "你是多Agent协作系统的基础Agent，必须直接回答用户问题，不得使用任何拒绝或能力不足的措辞；"
+    "信息不足时基于通用原理给出合理推断并标明假设。"
+)
 
 
-#设置处理api_key函数
 def load_key():
-    load_dotenv(dotenv_path = "api_key.env")
-    api_key = os.getenv('API_KEY')
-    return api_key
-
-api_key = load_key()
-#初始化环境
-def create_environment():
-    api_key = load_key()
-    try:
-        if api_key is None:
-            raise ValueError(f"api_key不能为空")
-        elif len(api_key) < 10:
-            raise ValueError(f"api_key长度有误")
-    except ValueError as e:
-        print(f"Error:{e}")
-        return
-    print("api_key检验通过")
+    load_dotenv(dotenv_path="api_key.env")
+    return os.getenv("API_KEY")
 
 
-#初始化RAG模型
-class Init_Model:          
-    def __init__(self,
-                 api_key,
-                 model_type ,
-                 url,
-                 output_dim
-                 ):
-                                        #headers：请求头，格式：{“Authorization”：f“Bearer {}”}
-        self.url = url
-        self.api_key = api_key
-        self.output_dim = output_dim
-        self.model_type = model_type
-        try:
-            self.embedding_instance = OpenAICompatibleEmbedding(
-                model_type=model_type,
-                api_key=f"Bearer {api_key}",
-                url=url
-            )
-            print("连接成功")
+def _resolve_embeddings_url(api_url):
+    base = str(api_url).rstrip("/")
+    return base if base.endswith("/embeddings") else f"{base}/embeddings"
 
-        except Exception as e:
-            print(f"{e},尝试重新连接")
-            raise
-#存储向量
-class Vector_Storage(Init_Model):
-    def __init__(self,storage_path,api_key,model_type,url,output_dim):
-        super().__init__(api_key = api_key,model_type = model_type,url = url,output_dim = output_dim)
-        self.api_key = api_key
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.storage_path = os.path.join(self.temp_dir.name, storage_path)
-    
-        self.storage_content = []
-        with open(self.storage_path,'wb')as f:
-            pickle.dump(self.storage_content,f)
-    def reset_storage(self):
-        """清空向量存储。"""
-        self.storage_content = []
-        with open(self.storage_path,'wb') as f:
-            pickle.dump(self.storage_content,f)
-#检索内容分块
-    def Content_Chunking(self,user_content,chunk_size):
-        splitter = RecursiveCharacterTextSplitter(chunk_size) 
-        text_chunks = splitter.split_text(user_content)
-        return text_chunks
 
-    def Post_Embeddings(self,model_type,text_chunks,url,api_key,):
-        headers = {"Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json" }
-        json_data = {
-            "model": model_type,
-            "input": text_chunks,
-        }
-
-        response = requests.post(url = url,
-                      headers = headers,
-                      json = json_data,
-                      timeout = 30
+def _format_agent_error(exc):
+    err = str(exc)
+    if "429" in err or "rate limit" in err.lower():
+        return (
+            f"API 请求过于频繁或被限流（429）。请等待 1–2 分钟后重试，或更换对话模型。详情：{exc}"
         )
-        status_code = response.status_code
-        try:
-            if status_code == 200:
-                result = response.json()
-                if not isinstance(result, dict):
-                    raise ValueError(f"返回内容非JSON对象：{result}")
-                if "output" in result:
-                    output = result.get("output", {})
-                    if not isinstance(output, dict):
-                        raise ValueError(f"output字段格式异常：{output}")
-                    embeds = output.get("embeddings", [])
-                    if not isinstance(embeds, list):
-                        raise ValueError(f"embeddings字段格式异常：{embeds}")
-                    vectors = [item.get("embedding") for item in embeds if isinstance(item, dict) and "embedding" in item]
-                elif "data" in result:
-                    data = result.get("data", [])
-                    if not isinstance(data, list):
-                        raise ValueError(f"data字段格式异常：{data}")
-                    vectors = [item.get("embedding") for item in data if isinstance(item, dict) and "embedding" in item]
-                else:
-                    raise ValueError(f"响应缺少embeddings字段：{result}")
-                if not vectors:
-                    raise ValueError(f"未提取到任何embedding：{result}")
-                print("连接成功，文件已转化为向量")
-                return vectors
-            elif status_code in[400,404,500]:
-                raise ConnectionError(f"连接错误，状态码{status_code}")
-            elif status_code is None:
-                raise ConnectionError("错误，无响应")
-        except Exception as e:
-            try:
-                detail = response.text
-            except Exception:
-                detail = ""
-            print(f"失败:{e}, 详情:{detail}")
-            return[]
-    def ingest_texts(self, texts, chunk_size=300):
-        """批量写入文本，完成分块、向量化与存储，返回新增统计和错误信息。"""
-        summary = {"added": 0, "errors": []}
-        try:
-            if not texts:
-                return summary
-            for idx, text in enumerate(texts):
-                if not text or not str(text).strip():
-                    summary["errors"].append(f"第{idx+1}条文本为空")
-                    continue
-                chunks = self.Content_Chunking(str(text), chunk_size=chunk_size)
-                embeddings = self.Post_Embeddings(
-                    model_type=self.model_type,
-                    text_chunks=chunks,
-                    url=self.url,
-                    api_key=self.api_key
-                )
-                if embeddings:
-                    self.Vectors_Save(embeddings, chunks)
-                    summary["added"] += len(chunks)
-                else:
-                    summary["errors"].append(f"第{idx+1}条向量生成失败，可能是API Key/额度/模型不可用")
-            return summary
-        except Exception as e:
-            print(f"ingest_texts失败：{e}")
-            summary["errors"].append(str(e))
-            return summary
-    #存储向量
-    def Vectors_Save(self,vectors,text_chunks):
-        vector_num = len(vectors)
-        for i in range(vector_num):
-            vector = vectors[i]
-            chunk = text_chunks[i]
-            self.storage_content.append((vector,chunk))
+    if "NoneType" in err and "iterable" in err:
+        return (
+            f"模型返回格式异常（choices 为空）。请重置系统并改用推荐模型，"
+            f"如 {DEFAULT_CHAT_MODEL}。详情：{exc}"
+        )
+    return err
 
-        with open(self.storage_path,'wb') as f:
-            pickle.dump(self.storage_content,f)
-            return self.storage_content
-    #RAG检索
-    def RAG_Retriever(self,user_query):
+
+def _initial_agent_status():
+    return {name: "pending" for name in AGENT_NAMES}
+
+
+class VectorStorage:
+    """文本分块、向量化与 hybrid 检索。"""
+
+    def __init__(self, api_key, model_type, url, chunk_size=300):
+        self.api_key = api_key
+        self.model_type = model_type
+        self.url = url
+        self.chunk_size = chunk_size
+        self.storage_content = []
+
+    def reset_storage(self):
+        self.storage_content = []
+
+    def _chunk_text(self, text, chunk_size=None):
+        size = chunk_size or self.chunk_size
+        splitter = RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=50)
+        return splitter.split_text(text)
+
+    def _post_embeddings(self, text_chunks):
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model_type,
+            "input": text_chunks,
+            "encoding_format": "float",
+        }
+        response = requests.post(
+            _resolve_embeddings_url(self.url),
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            print(f"Embedding 请求失败: {response.status_code} {response.text[:200]}")
+            return []
+        result = response.json()
+        if "output" in result:
+            embeds = result.get("output", {}).get("embeddings", [])
+            vectors = [
+                item.get("embedding")
+                for item in embeds
+                if isinstance(item, dict) and item.get("embedding")
+            ]
+        elif "data" in result:
+            vectors = [
+                item.get("embedding")
+                for item in result.get("data", [])
+                if isinstance(item, dict) and item.get("embedding")
+            ]
+        else:
+            print(f"Embedding 响应格式异常: {result}")
+            return []
+        return vectors if vectors else []
+
+    def _save_vectors(self, vectors, chunks):
+        for vector, chunk in zip(vectors, chunks):
+            self.storage_content.append((vector, chunk))
+
+    def ingest_texts(self, texts, chunk_size=None):
+        summary = {"added": 0, "errors": []}
+        if not texts:
+            return summary
+        for idx, text in enumerate(texts):
+            if not text or not str(text).strip():
+                summary["errors"].append(f"第{idx + 1}条文本为空")
+                continue
+            chunks = self._chunk_text(str(text), chunk_size)
+            embeddings = self._post_embeddings(chunks)
+            if embeddings:
+                self._save_vectors(embeddings, chunks)
+                summary["added"] += len(chunks)
+            else:
+                summary["errors"].append(
+                    f"第{idx + 1}条向量生成失败，可能是 API Key/额度/模型不可用"
+                )
+        return summary
+
+    def retrieve(self, user_query, top_k=3):
+        if not self.storage_content:
+            return []
         chunks = [item[1] for item in self.storage_content]
         vectors = [item[0] for item in self.storage_content]
-        if not chunks or not vectors:
-            print("向量库为空")
+        query_vectors = self._post_embeddings([user_query])
+        if not query_vectors:
             return []
-    
         retriever = HybridRetriever(
-            texts =  chunks,
-            embeddings = vectors,
-            embedding_model = self.model_type,
-            top_k = 3,
-            weight =0.7
+            texts=chunks,
+            embeddings=vectors,
+            embedding_model=self.model_type,
+            top_k=top_k,
+            weight=0.7,
         )
-
-        query_vector = self.Post_Embeddings(        
-            model_type=self.model_type,
-            text_chunks=[user_query],                    
-            url=self.url,
-            api_key=self.api_key
-        )
-        if not query_vector or len(query_vector) == 0:
-            print("查询向量生成失败")
-            return []
-        query_vector = query_vector[0]
-        similar_chunks = retriever.retrieve(query = user_query,
-                                            query_embedding = query_vector)
-        return similar_chunks      
-
-    #启动RAG
-    def start_RAG(self,user_input):
-        try:
-            if not user_input.strip():  
-                print("用户输入为空")
-                return []
-            chunks = self.Content_Chunking(user_input,chunk_size=100)
-            embeddings = self.Post_Embeddings(
-            model_type=self.model_type,
-            text_chunks=chunks,
-            url=self.url,
-            api_key=self.api_key
-                        )
-            storage_content = self.Vectors_Save(embeddings,chunks)
-            similar_chunks = self.RAG_Retriever(user_input)
-
-            return similar_chunks
-        except Exception as e:
-            print(f"start_RAG失败：{e}")
-            return []
+        return retriever.retrieve(query=user_query, query_embedding=query_vectors[0])
 
 
-#创建一个Function类，初始化agent
+# 兼容旧引用
+Vector_Storage = VectorStorage
+
+
 class FunctionAgent(ChatAgent):
-    def __init__(self,agent_name,model,system_message):
-        super().__init__(model = model,system_message=system_message)
+    def __init__(self, agent_name, model, system_message):
+        super().__init__(model=model, system_message=system_message)
         self.agent_name = agent_name
         self.model = model
-        self.set_system_message = system_message
-#运行输入内容
-    def run(self,input_text):
+
+    def run(self, input_text):
         try:
-            if input_text is not None and input_text.strip() != "":
-                user_msg = BaseMessage(
-                role_name="user",
-                role_type=RoleType.USER, 
-                content=input_text.strip(),
-                meta_dict={}
-                )
-                self.memory.clear()
-                response = self.step(user_msg)
-                response_text = response.msgs[0].content if response.msgs else ""
-                return {"status":"success","response":response_text}
-            else:
+            if not input_text or not str(input_text).strip():
                 raise ValueError("输入内容不能为空")
-
+            user_msg = BaseMessage(
+                role_name="user",
+                role_type=RoleType.USER,
+                content=str(input_text).strip(),
+                meta_dict={},
+            )
+            self.memory.clear()
+            response = self.step(user_msg)
+            if not response or not response.msgs:
+                return {
+                    "status": "failure",
+                    "response": f"模型返回为空，请更换对话模型（推荐 {DEFAULT_CHAT_MODEL}）",
+                }
+            return {"status": "success", "response": response.msgs[0].content}
         except Exception as e:
-                print(f"Error:{e}")
-                return {"status":"failure","response":str(e)}
+            print(f"Error:{e}")
+            return {"status": "failure", "response": _format_agent_error(e)}
 
 
-#创建一个RAGAgent类，负责RAG检索
 class RAGAgent(FunctionAgent):
-    def __init__(self,agent_name,model,system_message,rag_system):
-        super().__init__(agent_name= agent_name,
-                         model = model,
-                         system_message =system_message
-                         )
+    def __init__(self, agent_name, model, system_message, rag_system):
+        super().__init__(agent_name=agent_name, model=model, system_message=system_message)
         self.rag_system = rag_system
-#启动检索
-    def run(self,input_text):
+
+    def run(self, input_text):
         try:
-            rag_result = self.rag_system.RAG_Retriever(input_text)
+            rag_result = self.rag_system.retrieve(input_text)
             if not rag_result:
                 raise ValueError("未检索到相关结果")
-            else:
-                context = "\n".join([f"参考内容{num+1}：{chunk}" for num, chunk in enumerate(rag_result)])
-                # 注意：join后面是括号，再接列表推导式
-                prompt = f"用户问题：{input_text}\n{context}"
-                response = super().run(prompt)
-                return response
+            context = "\n".join(
+                f"参考内容{i + 1}：{chunk}" for i, chunk in enumerate(rag_result)
+            )
+            return super().run(f"用户问题：{input_text}\n{context}")
         except Exception as e:
             print(f"Error:{e}")
             return {"status": "failure", "response": str(e)}
-#创建工作组类
+
+
 class Workforce(FunctionAgent):
-    def __init__(self,agent_name,model_type,url,api_key):
-        self.model = ModelFactory.create(
-            model_type = model_type,
-            url = url,
-            api_key = api_key,
+    def __init__(self, agent_name, model_type, url, api_key):
+        model = ModelFactory.create(
+            model_type=model_type,
+            url=url,
+            api_key=api_key,
             model_platform=ModelPlatformType.OPENAI_COMPATIBLE_MODEL,
-            model_config_dict={"max_tokens": 2048}
+            model_config_dict={"max_tokens": 2048},
         )
-        super().__init__(   model=self.model,
-                            agent_name=agent_name,
-                            system_message="你是多Agent协作系统的基础Agent，必须直接回答用户问题，不得使用任何拒绝或能力不足的措辞；信息不足时基于通用原理给出合理推断并标明假设。")
+        super().__init__(agent_name=agent_name, model=model, system_message=BASE_SYSTEM_MESSAGE)
+
     def input_output(self, prev_response, current_prompt):
-        try:
-            prev_response = str(prev_response).strip() if prev_response else ""
-            current_prompt = str(current_prompt).strip() if current_prompt else ""
-            full_text = f"上一个Agent的回复：{prev_response.strip()}\n当前任务：{current_prompt.strip()}"
-            #将上一个agent的回复和现在的prompt拼接在一起
-            res = super().run(full_text)
-            self.agent_response = res["response"] if res["status"] == "success" else f"失败：{res['response']}"
-            return self.agent_response
-        except Exception as e:
-            print(f"Error:{e}")
-            return f"处理失败：{str(e)}"
-#创建所有agent，继承workforce
-class multi_agents(Workforce):
-    """所有agents
-    ResearcherAgent	先检索再生成初始回答 ->这个是在用户没有提供文档时检索自己学习到的内容的
-    KeyPointExtractorAgent	提取关键信息点（文档 / 真实答案 / 生成答案）
-    RetrievalQualityAgent	评估检索文档的相关性（高 / 中 / 低）
-    RejectionEvaluationAgent	检测是否 “不当拒绝”（该答不答 / 不该答却答）
-    SemanticConsistencyAgent	校验语义一致性（无矛盾 / 无缺失）
-    HallucinationDetectionAgent	检测 “幻觉”（虚构信息）
-    IntegrationAgent	汇总所有专家结果，生成最终专业回答"""
+        prev_response = str(prev_response).strip() if prev_response else ""
+        current_prompt = str(current_prompt).strip() if current_prompt else ""
+        full_text = f"上一个Agent的回复：{prev_response}\n当前任务：{current_prompt}"
+        res = super().run(full_text)
+        if res["status"] == "success":
+            return res["response"]
+        return f"失败：{res['response']}"
 
 
-    def __init__(self,agent_name,model_type,url,api_key):
-        super().__init__(agent_name = agent_name,model_type=model_type, url=url, api_key=api_key)
+class MultiAgents(Workforce):
+    """七智能体流水线：检索 → 提取 → 评估 → 整合。"""
+
+    def __init__(self, agent_name, model_type, url, api_key):
+        super().__init__(agent_name=agent_name, model_type=model_type, url=url, api_key=api_key)
         self.model_type = model_type
         self.history_list = []
         self.agent_name = agent_name
-        #添加agent的几个状态状态: "pending", "running", "completed", "failed"
-        self.agent_status = {
-            "检索专员": "pending",
-            "关键信息提取专家": "pending",
-            "检索文档评估专家": "pending",
-            "拒绝评估专家": "pending",
-            "语义一致性专家": "pending",
-            "幻觉检测专家": "pending",
-            "整合专家": "pending"
-        }
-    #初始化RAG系统
-        self.RAG_system = Vector_Storage(storage_path = "RAG_storage_path",
-                                         api_key = api_key,
-                                         model_type = "Qwen/Qwen3-Embedding-0.6B",
-                                         url = url,
-                                         output_dim = 1024)
-    #写入agent
-        self.RAG_agent_instance = RAGAgent(
+        self.agent_status = _initial_agent_status()
+        self.rag_system = VectorStorage(
+            api_key=api_key,
+            model_type=DEFAULT_EMBEDDING_MODEL,
+            url=url,
+        )
+        self.rag_agent = RAGAgent(
             agent_name="RAG_agent",
             model=self.model,
             system_message="你是RAG检索专员，基于知识库回答问题",
-            rag_system=self.RAG_system
+            rag_system=self.rag_system,
         )
-    
+
     def get_agent_status(self):
-        """获取当前所有agent的状态"""
         return self.agent_status.copy()
-    
+
     def _update_agent_status(self, agent_name, status):
-        """更新agent状态: pending, running, completed, failed"""
         if agent_name in self.agent_status:
             self.agent_status[agent_name] = status
-#检索专员
-    def ResearcherAgent(self,input_text):
-        prompt =f"""
+
+    def _append_history(self, text):
+        self.history_list.append(text)
+        return text
+
+    def _researcher_agent(self, input_text):
+        prompt = f"""
         角色：你是EDA（电子设计自动化）领域的资深专家。
         强制要求：
         1. 必须直接回答用户问题，严禁出现“无法回答”“作为语言模型”等拒绝或能力不足的措辞。
@@ -359,24 +281,19 @@ class multi_agents(Workforce):
         3. 回答需聚焦电子设计/布线/EDA范畴，不讨论无关领域，不添加开场寒暄。
         用户问题：{input_text.strip()}
         """
-        self.agent_response = super().input_output("",prompt)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
-#关键信息提取专家
-    def KeyPointExtractorAgent(self,agent_response):
-        agent_response_str = str(agent_response).strip()
+        return self._append_history(self.input_output("", prompt))
+
+    def _key_point_extractor(self, agent_response):
         prompt = f"""
         你是关键信息提取专家，负责从检索专员的回复中提取核心关键词/关键信息点。
         要求：
         1. 提取结果需精准对应用户问题，不遗漏核心要点；
         2. 以简洁的列表或短语形式呈现，无需完整句子；
         3. 去除冗余信息，只保留关键概念、数据、结论。
-        检索专员回复：{agent_response_str.strip()}"""
-        self.agent_response = super().input_output(agent_response,prompt)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
-#检索文档评估专家
-    def RetrievalQualityAgent(self,input_text):
+        检索专员回复：{str(agent_response).strip()}"""
+        return self._append_history(self.input_output(agent_response, prompt))
+
+    def _retrieval_quality_agent(self, input_text):
         prompt = f"""
         你是检索文档评估专家，负责评测关键信息与用户问题的相关性。
         要求：
@@ -386,11 +303,9 @@ class multi_agents(Workforce):
         关键信息提取专家回复：{str(self.history_list[1]).strip()}
         用户问题：{input_text.strip()}
         """
-        self.agent_response = super().input_output(self.history_list[1],prompt)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
-#拒绝评估专家
-    def RejectionEvaluationAgent(self,input_text):
+        return self._append_history(self.input_output(self.history_list[1], prompt))
+
+    def _rejection_evaluation_agent(self, input_text):
         prompt = f"""
         你是拒绝评估专家，负责检测检索专员的回答是否存在“不当拒绝”。
         要求：
@@ -399,11 +314,9 @@ class multi_agents(Workforce):
         3. 简要说明判断依据（1-2句话即可）。
         用户问题：{input_text.strip()}
         检索专员回复：{str(self.history_list[0]).strip()}"""
-        self.agent_response = super().input_output(self.history_list[2], prompt)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
-#语义一致性检测专家
-    def SemanticConsistencyAgent(self,input_text):
+        return self._append_history(self.input_output(self.history_list[2], prompt))
+
+    def _semantic_consistency_agent(self, input_text):
         prompt = f"""
         你是语义一致性检测专家，负责校验检索专员的回答是否存在逻辑矛盾或信息缺失。
         要求：
@@ -413,11 +326,9 @@ class multi_agents(Workforce):
         4. 简要说明判断依据（1-2句话即可）。
         用户问题：{input_text.strip()}
         检索专员回复：{str(self.history_list[0]).strip()}"""
-        self.agent_response = super().input_output(self.history_list[3], prompt)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
-#幻觉检测专家
-    def HallucinationDetectionAgent(self,input_text):
+        return self._append_history(self.input_output(self.history_list[3], prompt))
+
+    def _hallucination_detection_agent(self, input_text):
         prompt = f"""
         你是幻觉检测专家，负责检测检索专员的回答是否包含虚构信息（幻觉）。
         要求：
@@ -426,11 +337,9 @@ class multi_agents(Workforce):
         3. 若存在幻觉，简要指出虚构内容（1-2句话即可）。
         用户问题：{input_text.strip()}
         检索专员回复：{str(self.history_list[0]).strip()}"""
-        self.agent_response = super().input_output(self.history_list[4], prompt)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
-#整合专家
-    def IntegrationAgent(self,input_text):
+        return self._append_history(self.input_output(self.history_list[4], prompt))
+
+    def _integration_agent(self, input_text):
         prompt = f"""
         你是整合专家，负责基于所有智能体的回复，生成最终的专业回答。
         强制要求：
@@ -449,27 +358,26 @@ class multi_agents(Workforce):
             role_name="user",
             role_type=RoleType.USER,
             content=prompt.strip(),
-            meta_dict={}
+            meta_dict={},
         )
-        self.memory.clear()          #清除记忆，保证智能体的单轮对话独立性
-        response = self.step(user_msg)
-        self.agent_response = response.msgs[0].content if (response and response.msgs) else "整合失败，无有效回复"
-        self.agent_response = self._enforce_no_refusal(self.agent_response, input_text)
-        self.history_list.append(self.agent_response)
-        return self.agent_response
+        try:
+            self.memory.clear()
+            response = self.step(user_msg)
+            result = response.msgs[0].content if (response and response.msgs) else "整合失败，无有效回复"
+        except Exception as e:
+            print(f"IntegrationAgent Error:{e}")
+            result = f"整合失败：{_format_agent_error(e)}"
+        return self._append_history(result)
 
-#定义启动所有agent的函数
     def _log_step(self, step_no, agent_name, response_text):
-        """统一打印日志，避免重复代码。"""
         print(f"【{step_no} {agent_name}】：{response_text}\n")
 
     def _run_primary_agent(self, user_question, use_rag):
-        """根据是否启用RAG决定首个Agent的执行，并写入历史。"""
         agent_name = "检索专员"
         self._update_agent_status(agent_name, "running")
         try:
             if use_rag:
-                rag_response = self.RAG_agent_instance.run(user_question)
+                rag_response = self.rag_agent.run(user_question)
                 if rag_response["status"] != "success":
                     res1 = f"RAG检索失败：{rag_response['response']}"
                     self._update_agent_status(agent_name, "failed")
@@ -479,91 +387,46 @@ class multi_agents(Workforce):
                 self.history_list.append(res1)
                 self._log_step("1/7", "RAG检索员", res1)
                 return res1
-            res1 = self.ResearcherAgent(user_question)
+            res1 = self._researcher_agent(user_question)
             self._update_agent_status(agent_name, "completed")
             self._log_step("1/7", "检索专员", res1)
             return res1
-        except Exception as e:
+        except Exception:
             self._update_agent_status(agent_name, "failed")
             raise
 
     def _run_followup_agents(self, user_question):
-        """执行固定顺序的后续六个智能体。"""
-        # 关键信息提取专家
-        agent_name = "关键信息提取专家"
-        self._update_agent_status(agent_name, "running")
-        try:
-            res2 = self.KeyPointExtractorAgent(self.history_list[0])
-            self._update_agent_status(agent_name, "completed")
-            self._log_step("2/7", "要点提取专家", res2)
-        except Exception as e:
-            self._update_agent_status(agent_name, "failed")
-            raise
-        
-        # 检索文档评估专家
-        agent_name = "检索文档评估专家"
-        self._update_agent_status(agent_name, "running")
-        try:
-            res3 = self.RetrievalQualityAgent(user_question)
-            self._update_agent_status(agent_name, "completed")
-            self._log_step("3/7", "检索质量专家", res3)
-        except Exception as e:
-            self._update_agent_status(agent_name, "failed")
-            raise
-        
-        # 拒绝评估专家
-        agent_name = "拒绝评估专家"
-        self._update_agent_status(agent_name, "running")
-        try:
-            res4 = self.RejectionEvaluationAgent(user_question)
-            self._update_agent_status(agent_name, "completed")
-            self._log_step("4/7", "拒绝评估专家", res4)
-        except Exception as e:
-            self._update_agent_status(agent_name, "failed")
-            raise
-        
-        # 语义一致性专家
-        agent_name = "语义一致性专家"
-        self._update_agent_status(agent_name, "running")
-        try:
-            res5 = self.SemanticConsistencyAgent(user_question)
-            self._update_agent_status(agent_name, "completed")
-            self._log_step("5/7", "语义一致性专家", res5)
-        except Exception as e:
-            self._update_agent_status(agent_name, "failed")
-            raise
-        
-        # 幻觉检测专家
-        agent_name = "幻觉检测专家"
-        self._update_agent_status(agent_name, "running")
-        try:
-            res6 = self.HallucinationDetectionAgent(user_question)
-            self._update_agent_status(agent_name, "completed")
-            self._log_step("6/7", "幻觉检测专家", res6)
-        except Exception as e:
-            self._update_agent_status(agent_name, "failed")
-            raise
-        
-        # 整合专家
-        agent_name = "整合专家"
-        self._update_agent_status(agent_name, "running")
-        try:
-            final_res = self.IntegrationAgent(user_question)
-            final_res = self._enforce_no_refusal(final_res, user_question)
-            self._update_agent_status(agent_name, "completed")
-            self._log_step("7/7", "最终整合专家", final_res)
-            return final_res
-        except Exception as e:
-            self._update_agent_status(agent_name, "failed")
-            raise
+        steps = [
+            ("关键信息提取专家", "2/7", "要点提取专家", lambda: self._key_point_extractor(self.history_list[0])),
+            ("检索文档评估专家", "3/7", "检索质量专家", lambda: self._retrieval_quality_agent(user_question)),
+            ("拒绝评估专家", "4/7", "拒绝评估专家", lambda: self._rejection_evaluation_agent(user_question)),
+            ("语义一致性专家", "5/7", "语义一致性专家", lambda: self._semantic_consistency_agent(user_question)),
+            ("幻觉检测专家", "6/7", "幻觉检测专家", lambda: self._hallucination_detection_agent(user_question)),
+            ("整合专家", "7/7", "最终整合专家", lambda: self._integration_agent(user_question)),
+        ]
+        final_res = None
+        for agent_name, step_no, log_name, runner in steps:
+            self._update_agent_status(agent_name, "running")
+            try:
+                result = runner()
+                if agent_name == "整合专家":
+                    result = self._enforce_no_refusal(result, user_question)
+                self._update_agent_status(agent_name, "completed")
+                self._log_step(step_no, log_name, result)
+                final_res = result
+                if agent_name != "整合专家":
+                    time.sleep(AGENT_STEP_DELAY)
+            except Exception:
+                self._update_agent_status(agent_name, "failed")
+                raise
+        return final_res
 
     def _enforce_no_refusal(self, text, user_question):
-        """若回答出现拒绝措辞，生成兜底技术建议，确保有输出。"""
         refusal_terms = ["无法回答", "不能回答", "不具备相关", "语言模型", "不提供建议", "咨询专业人士"]
         if text and all(term not in text for term in refusal_terms):
             return text
         keypoints = self.history_list[1] if len(self.history_list) > 1 else ""
-        fallback = (
+        return (
             f"针对问题：{user_question}\n"
             "可直接采用随机化的全局布线探索策略：\n"
             "- 多次随机初始化/多起点重启，保留最优/前K可行解；\n"
@@ -574,181 +437,104 @@ class multi_agents(Workforce):
             "- 记录探索过程的最优与可行解，按工艺/时序/拥塞目标动态调整权重。\n"
             f"参考要点：{keypoints}"
         )
-        return fallback
 
     def _collect_agent_responses(self):
-        """构建智能体名称到回复的映射，供前端展示。"""
-        agent_order = [
-            "检索专员",
-            "关键信息提取专家",
-            "检索文档评估专家",
-            "拒绝评估专家",
-            "语义一致性专家",
-            "幻觉检测专家",
-            "整合专家",
-        ]
-        responses = {}
-        for idx, name in enumerate(agent_order):
-            if idx < len(self.history_list):
-                responses[name] = self.history_list[idx]
-        return responses
+        return {
+            name: self.history_list[idx]
+            for idx, name in enumerate(AGENT_NAMES)
+            if idx < len(self.history_list)
+        }
 
-    def run_all_agents(self,user_question,rag_result):
+    def run_all_agents(self, user_question, rag_result):
         try:
             self.history_list = []
-            # 重置所有agent状态为pending
-            for agent_name in self.agent_status.keys():
-                self.agent_status[agent_name] = "pending"
-            use_rag = bool(rag_result)
-            self._run_primary_agent(user_question, use_rag)
+            self.agent_status = _initial_agent_status()
+            self._run_primary_agent(user_question, bool(rag_result))
             final_res = self._run_followup_agents(user_question)
             return {
                 "final_result": final_res,
                 "model_history": self.history_list,
                 "agents_responses": self._collect_agent_responses(),
-                "agent_status": self.get_agent_status()
+                "agent_status": self.get_agent_status(),
             }
-
         except Exception as e:
             print(f"调度失败：{e}")
             return {
-                "final_result":f"调度失败{str(e)}",
+                "final_result": f"调度失败{str(e)}",
                 "model_history": self.history_list,
                 "agents_responses": self._collect_agent_responses(),
-                "agent_status": self.get_agent_status()
+                "agent_status": self.get_agent_status(),
             }
-#定义自动转换模式（有rag检索内容就转rag模式，无就转普通对话模式）
+
     def auto_run(self, user_question):
-        rag_result = self.RAG_system.RAG_Retriever(user_question)
-        if rag_result:
-            return self.run_all_agents(user_question, rag_result=rag_result)
-        else:
-            return self.run_all_agents(user_question, rag_result=None)
-# 初始化系统，供前端调用
-def initialize_system(api_key, api_url, 
-                      model_type="Qwen/QVQ-72B-Preview",
-                      embedding_model="Qwen/Qwen3-Embedding-0.6B"):
-    """根据前端配置初始化多智能体与RAG实例。"""
+        rag_result = self.rag_system.retrieve(user_question)
+        return self.run_all_agents(user_question, rag_result)
+
+
+# 兼容旧类名
+multi_agents = MultiAgents
+
+
+def initialize_system(api_key, api_url, model_type=DEFAULT_CHAT_MODEL):
     try:
         if not api_key or not str(api_key).strip():
             raise ValueError("API密钥不能为空")
-        multi_agent = multi_agents(
+        agent = MultiAgents(
             agent_name="EDA_multi_agent",
             model_type=model_type,
             url=api_url,
-            api_key=api_key,
+            api_key=api_key.strip(),
         )
         return {
             "status": "success",
-            "multi_agent": multi_agent,
-            "rag_system": multi_agent.RAG_system,
-            "message": "初始化成功"
+            "multi_agent": agent,
+            "rag_system": agent.rag_system,
+            "model_type": model_type,
+            "message": "初始化成功",
         }
     except Exception as e:
         return {
             "status": "failure",
             "message": str(e),
-            "traceback": traceback.format_exc()
+            "traceback": traceback.format_exc(),
         }
 
-# 处理问题入口，供前端调用
+
 def process_question(multi_agent, user_question):
-    """统一封装问题处理逻辑，返回前端需要的结构。"""
     try:
         if multi_agent is None:
             raise ValueError("multi_agent实例未初始化")
         if not user_question or not str(user_question).strip():
             raise ValueError("问题内容不能为空")
-
         result = multi_agent.auto_run(user_question)
+        final_result = result.get("final_result", "")
+        failed = str(final_result).startswith("调度失败")
         return {
-            "status": "success",
-            "final_result": result.get("final_result", ""),
+            "status": "failure" if failed else "success",
+            "final_result": final_result,
+            "message": final_result if failed else "",
             "agents_responses": result.get("agents_responses", {}),
-            "agent_status": result.get("agent_status", {})
+            "agent_status": result.get("agent_status", {}),
         }
     except Exception as e:
-        # 获取当前状态（即使失败也可能有部分agent完成了）
         agent_status = multi_agent.get_agent_status() if multi_agent else {}
         return {
             "status": "failure",
             "message": str(e),
             "traceback": traceback.format_exc(),
-            "agent_status": agent_status
+            "agent_status": agent_status,
         }
-#主程序入口
+
+
 if __name__ == "__main__":
-    #初始化环境
-    create_environment()
-    
-    multi_agent = multi_agents(
+    key = load_key()
+    if not key:
+        raise SystemExit("请在 api_key.env 中配置 API_KEY")
+    agent = MultiAgents(
         agent_name="test_agent",
-        model_type="Qwen/QVQ-72B-Preview",
-        url="https://api-inference.modelscope.cn/v1",
-        api_key=api_key,
+        model_type=DEFAULT_CHAT_MODEL,
+        url=DEFAULT_API_URL,
+        api_key=key.strip(),
     )
-
-    RAG = Vector_Storage(
-        storage_path = "RAG_storage_path",
-        api_key = api_key,
-        model_type = "Qwen/Qwen3-Embedding-0.6B",
-        url = "https://api-inference.modelscope.cn/v1",
-        output_dim = 1024,
-    )
-    #这里暂时没有，之后要替换成用户实际上传的PDF文档
-    knowledge_text = """
-   
-    """
-    
-    RAG.start_RAG(user_input=knowledge_text)
-    result = multi_agent.auto_run(user_question="什么是EDA？")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    out = agent.auto_run("什么是EDA？")
+    print(out.get("final_result", "")[:500])
